@@ -888,6 +888,365 @@ Channels are a higher-level abstraction over sockets, commonly used in Java NIO 
 
 ---
 
+## TCP Connection vs Socket vs HTTP: Key Differences
+
+This is a common source of confusion. Let's clarify the relationship:
+
+### The Hierarchy
+
+```
++------------------------------------------------------------------+
+|                    CONCEPTUAL HIERARCHY                          |
++------------------------------------------------------------------+
+
+  +----------------------------------------------------------+
+  |                      HTTP (Layer 7)                      |
+  |   Application Protocol - defines message format/semantics |
+  |   "GET /index.html HTTP/1.1"                             |
+  +----------------------------------------------------------+
+                              |
+                        runs over
+                              |
+                              v
+  +----------------------------------------------------------+
+  |                 TCP CONNECTION (Layer 4)                 |
+  |   Logical communication channel between two endpoints     |
+  |   Identified by: (SrcIP, SrcPort, DstIP, DstPort)        |
+  +----------------------------------------------------------+
+                              |
+                       accessed via
+                              |
+                              v
+  +----------------------------------------------------------+
+  |                    SOCKET (API/Handle)                   |
+  |   Programming interface to access the connection          |
+  |   A file descriptor (integer) in your process            |
+  +----------------------------------------------------------+
+```
+
+### Socket vs Connection: The Key Insight
+
+**A socket is NOT inside a connection. A socket is the HANDLE/API to access a connection.**
+
+Think of it this way:
+
+```
++------------------------------------------------------------------+
+|                    ANALOGY: PHONE CALL                           |
++------------------------------------------------------------------+
+
+  Phone Call = TCP Connection
+      - The actual communication channel
+      - Exists between two parties
+      - Has state (ringing, connected, ended)
+
+  Phone Handset = Socket
+      - The device you use to access the call
+      - You speak into it, listen from it
+      - Multiple handsets can exist (extensions)
+      - The handset is not "inside" the call
+
+  Conversation Protocol = HTTP
+      - The language/format you use
+      - "Hello, how are you?" "I'm fine, thanks"
+      - Rules for taking turns, ending conversation
+```
+
+### Detailed Breakdown
+
+```
++------------------------------------------------------------------+
+|                         SOCKET                                   |
++------------------------------------------------------------------+
+|                                                                  |
+|  WHAT IT IS:                                                     |
+|  - A kernel data structure + file descriptor                     |
+|  - Programming API endpoint                                      |
+|  - Handle for your process to read/write network data            |
+|                                                                  |
+|  WHAT IT IS NOT:                                                 |
+|  - NOT the connection itself                                     |
+|  - NOT a physical thing                                          |
+|                                                                  |
+|  LIFECYCLE:                                                      |
+|  - Created by socket() system call                               |
+|  - Can exist WITHOUT a connection (before connect/accept)        |
+|  - Can be bound to address without connection (UDP)              |
+|  - Destroyed by close()                                          |
+|                                                                  |
+|  CONTAINS:                                                       |
+|  - Local address (IP:Port)                                       |
+|  - Remote address (IP:Port) - if connected                       |
+|  - Protocol type (TCP/UDP)                                       |
+|  - State (LISTEN, ESTABLISHED, etc.)                             |
+|  - Send buffer (outgoing data queue)                             |
+|  - Receive buffer (incoming data queue)                          |
+|  - Socket options (timeouts, buffer sizes, etc.)                 |
+|                                                                  |
++------------------------------------------------------------------+
+```
+
+```
++------------------------------------------------------------------+
+|                     TCP CONNECTION                               |
++------------------------------------------------------------------+
+|                                                                  |
+|  WHAT IT IS:                                                     |
+|  - Logical bidirectional communication channel                   |
+|  - Stateful session between two endpoints                        |
+|  - Guarantees reliable, ordered delivery                         |
+|                                                                  |
+|  IDENTIFIED BY (5-tuple):                                        |
+|  - Protocol (TCP)                                                |
+|  - Source IP                                                     |
+|  - Source Port                                                   |
+|  - Destination IP                                                |
+|  - Destination Port                                              |
+|                                                                  |
+|  LIFECYCLE:                                                      |
+|  - Established via 3-way handshake (SYN, SYN-ACK, ACK)           |
+|  - Maintained with keep-alives and ACKs                          |
+|  - Terminated via 4-way handshake (FIN, ACK, FIN, ACK)           |
+|                                                                  |
+|  STATE MACHINE:                                                  |
+|  - LISTEN, SYN_SENT, SYN_RCVD, ESTABLISHED                       |
+|  - FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, LAST_ACK                  |
+|  - TIME_WAIT, CLOSED                                             |
+|                                                                  |
+|  PROVIDES:                                                       |
+|  - Reliable delivery (retransmissions)                           |
+|  - Ordered delivery (sequence numbers)                           |
+|  - Flow control (window size)                                    |
+|  - Congestion control                                            |
+|                                                                  |
++------------------------------------------------------------------+
+```
+
+```
++------------------------------------------------------------------+
+|                     HTTP PROTOCOL                                |
++------------------------------------------------------------------+
+|                                                                  |
+|  WHAT IT IS:                                                     |
+|  - Application-layer protocol (Layer 7)                          |
+|  - Defines message FORMAT and SEMANTICS                          |
+|  - Request-Response model                                        |
+|  - Stateless (each request independent)                          |
+|                                                                  |
+|  RUNS OVER:                                                      |
+|  - TCP (HTTP/1.0, HTTP/1.1, HTTP/2)                              |
+|  - QUIC/UDP (HTTP/3)                                             |
+|                                                                  |
+|  MESSAGE FORMAT:                                                 |
+|  +----------------------------------------------------------+    |
+|  | Request:                                                 |    |
+|  |   GET /index.html HTTP/1.1                               |    |
+|  |   Host: example.com                                      |    |
+|  |   User-Agent: Mozilla/5.0                                |    |
+|  |   Accept: text/html                                      |    |
+|  |   <blank line>                                           |    |
+|  |   [optional body]                                        |    |
+|  +----------------------------------------------------------+    |
+|  | Response:                                                |    |
+|  |   HTTP/1.1 200 OK                                        |    |
+|  |   Content-Type: text/html                                |    |
+|  |   Content-Length: 1234                                   |    |
+|  |   <blank line>                                           |    |
+|  |   <html>...</html>                                       |    |
+|  +----------------------------------------------------------+    |
+|                                                                  |
+|  KNOWS NOTHING ABOUT:                                            |
+|  - TCP connections (abstracted away)                             |
+|  - Sockets (programming detail)                                  |
+|  - IP addresses (handled by lower layers)                        |
+|                                                                  |
++------------------------------------------------------------------+
+```
+
+### How They Work Together
+
+```
++------------------------------------------------------------------+
+|              COMPLETE PICTURE: HTTP REQUEST FLOW                 |
++------------------------------------------------------------------+
+
+  YOUR APPLICATION (e.g., curl, browser, Python requests)
+       |
+       | 1. Application wants to fetch http://example.com/page
+       v
+  +----------------------------------------------------------+
+  |                    HTTP LAYER                            |
+  |  Formats the request:                                    |
+  |  "GET /page HTTP/1.1\r\nHost: example.com\r\n\r\n"       |
+  +----------------------------------------------------------+
+       |
+       | 2. HTTP gives this string to the socket
+       v
+  +----------------------------------------------------------+
+  |                    SOCKET (API)                          |
+  |  socket_fd = socket(AF_INET, SOCK_STREAM, 0)             |
+  |  connect(socket_fd, "93.184.216.34:80")                  |
+  |  write(socket_fd, http_request_string)                   |
+  |  read(socket_fd, response_buffer)                        |
+  +----------------------------------------------------------+
+       |
+       | 3. Socket operations trigger TCP layer
+       v
+  +----------------------------------------------------------+
+  |                 TCP CONNECTION                           |
+  |  - 3-way handshake establishes connection                |
+  |  - Segments the HTTP data                                |
+  |  - Adds sequence numbers                                 |
+  |  - Handles retransmissions                               |
+  |  - Receives ACKs from server                             |
+  +----------------------------------------------------------+
+       |
+       | 4. TCP hands off to IP layer
+       v
+  +----------------------------------------------------------+
+  |                    IP LAYER                              |
+  |  Routes packets to 93.184.216.34                         |
+  +----------------------------------------------------------+
+       |
+       v
+  [  Network  ] -----> [  Server  ]
+```
+
+### Multiple HTTP Requests Over One TCP Connection
+
+```
++------------------------------------------------------------------+
+|           HTTP/1.1 KEEP-ALIVE (Connection Reuse)                 |
++------------------------------------------------------------------+
+
+  ONE TCP CONNECTION (socket fd=5)
+  +--------------------------------------------------------------+
+  |                                                              |
+  |  Time -->                                                    |
+  |                                                              |
+  |  [TCP Handshake] --> [HTTP Req 1] --> [HTTP Resp 1]          |
+  |                      [HTTP Req 2] --> [HTTP Resp 2]          |
+  |                      [HTTP Req 3] --> [HTTP Resp 3]          |
+  |                      ...                                     |
+  |                      [HTTP Req N] --> [HTTP Resp N]          |
+  |                                                              |
+  |  [TCP Termination]                                           |
+  |                                                              |
+  +--------------------------------------------------------------+
+
+  - Single socket, single TCP connection
+  - Multiple HTTP request/response pairs
+  - More efficient than connection-per-request
+```
+
+### One Socket, Multiple Connections? NO!
+
+```
++------------------------------------------------------------------+
+|           COMMON MISCONCEPTION CLARIFIED                         |
++------------------------------------------------------------------+
+
+  WRONG: "One socket handles multiple connections"
+
+      Socket ----+----> Connection 1
+                 +----> Connection 2    <-- NOT how it works!
+                 +----> Connection 3
+
+  CORRECT: "One socket = One connection (for connected sockets)"
+
+      Socket A --------> Connection 1
+      Socket B --------> Connection 2
+      Socket C --------> Connection 3
+
+
+  SPECIAL CASE: Server LISTENING Socket
+
+      Listening Socket (fd=3, port 80)
+             |
+             | accept() creates NEW socket for each connection
+             |
+             +----> accept() returns fd=4 --> Connection from Client A
+             +----> accept() returns fd=5 --> Connection from Client B
+             +----> accept() returns fd=6 --> Connection from Client C
+
+      Listening socket does NOT have a connection
+      It creates NEW sockets that have connections
+```
+
+### Summary Comparison Table
+
+```
++------------------------------------------------------------------+
+|                    COMPARISON TABLE                              |
++----------+-----------------+------------------+-------------------+
+| Aspect   | Socket          | TCP Connection   | HTTP              |
++----------+-----------------+------------------+-------------------+
+| Layer    | API (spans      | Transport (L4)   | Application (L7)  |
+|          | L4-L7)          |                  |                   |
++----------+-----------------+------------------+-------------------+
+| What     | Handle/API      | Communication    | Message format    |
+|          | to access       | channel          | and semantics     |
+|          | network         |                  |                   |
++----------+-----------------+------------------+-------------------+
+| Created  | socket()        | 3-way handshake  | N/A (it's a       |
+| by       | system call     | (SYN/SYN-ACK/    | protocol spec)    |
+|          |                 | ACK)             |                   |
++----------+-----------------+------------------+-------------------+
+| Exists   | In kernel +     | Between two      | In the data       |
+| where    | file descriptor | network hosts    | being sent        |
+|          | in process      |                  |                   |
++----------+-----------------+------------------+-------------------+
+| Lifetime | Process-bound   | Until terminated | Per request       |
+|          |                 | or timeout       | (stateless)       |
++----------+-----------------+------------------+-------------------+
+| State    | Kernel struct   | TCP state        | Stateless         |
+|          | with buffers    | machine          | (cookies/sessions |
+|          |                 |                  | add state)        |
++----------+-----------------+------------------+-------------------+
+| Without  | Can exist       | Can exist        | Cannot exist      |
+| others   | without TCP     | without HTTP     | without TCP       |
+|          | connection      | (e.g., SSH uses  | (needs transport) |
+|          | (UDP socket)    | TCP)             |                   |
++----------+-----------------+------------------+-------------------+
+```
+
+### Code Example: Seeing All Three
+
+```
++------------------------------------------------------------------+
+|                    PYTHON EXAMPLE                                |
++------------------------------------------------------------------+
+
+  import socket
+
+  # 1. CREATE SOCKET (just an API handle, no connection yet)
+  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  print(f"Socket created: {sock.fileno()}")  # e.g., 3
+
+  # 2. ESTABLISH TCP CONNECTION (3-way handshake happens here)
+  sock.connect(("example.com", 80))
+  print("TCP connection established")
+
+  # 3. SEND HTTP REQUEST (application protocol over the connection)
+  http_request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+  sock.send(http_request)
+
+  # 4. RECEIVE HTTP RESPONSE
+  response = sock.recv(4096)
+  print(response.decode())
+
+  # 5. CLOSE (terminates TCP connection, releases socket)
+  sock.close()
+
+  # Timeline:
+  # socket()  --> Socket exists, NO connection
+  # connect() --> Socket + TCP Connection exist
+  # send()    --> HTTP data flows over TCP via Socket
+  # close()   --> Connection terminated, Socket released
+```
+
+---
+
 ## Related Topics
 - Network programming in various languages (Java NIO, Python asyncio, Go net)
 - Advanced topics: epoll, kqueue, io_uring, DPDK
