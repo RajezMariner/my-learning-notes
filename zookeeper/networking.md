@@ -515,6 +515,319 @@ Channels are a higher-level abstraction over sockets, commonly used in Java NIO 
 
 ## OS Networking Internals
 
+### What is a File Descriptor?
+
+A **file descriptor (fd)** is simply an **integer** that acts as a handle/index to access kernel resources. It's NOT the resource itself - it's a reference to it.
+
+```
++------------------------------------------------------------------+
+|                    FILE DESCRIPTOR EXPLAINED                     |
++------------------------------------------------------------------+
+
+  WHAT IT IS:
+  - A small non-negative integer (0, 1, 2, 3, 4, ...)
+  - An INDEX into the process's file descriptor table
+  - A HANDLE to access kernel-managed resources
+
+  WHAT IT IS NOT:
+  - NOT the actual file or socket data
+  - NOT a pointer to memory
+  - NOT unique across processes (fd=5 in Process A != fd=5 in Process B)
+
+  ANALOGY:
+  - File Descriptor = Coat check ticket number
+  - Kernel Resource = Your actual coat
+  - You give the ticket (fd) to get/use your coat (resource)
+```
+
+### File Descriptor Table Architecture
+
+```
++------------------------------------------------------------------+
+|            HOW FILE DESCRIPTORS WORK IN THE KERNEL               |
++------------------------------------------------------------------+
+
+  PROCESS A (PID 1234)
+  +------------------------------------------------------------------+
+  |                                                                  |
+  |  Process Control Block (PCB)                                     |
+  |  +------------------------------------------------------------+  |
+  |  |  PID: 1234                                                 |  |
+  |  |  State: RUNNING                                            |  |
+  |  |  ...                                                       |  |
+  |  |  File Descriptor Table Pointer  ------+                    |  |
+  |  +------------------------------------------------------------+  |
+  |                                          |                       |
+  +------------------------------------------|-----------------------+
+                                             |
+                                             v
+  +------------------------------------------------------------------+
+  |              FILE DESCRIPTOR TABLE (per process)                 |
+  +------------------------------------------------------------------+
+  |                                                                  |
+  |  Index   Flags        Pointer to Open File Description           |
+  |  (fd)                                                            |
+  |  +-----+----------+------------------------------------------+   |
+  |  |  0  | O_RDONLY | -----> Open File Description (stdin)     |   |
+  |  +-----+----------+------------------------------------------+   |
+  |  |  1  | O_WRONLY | -----> Open File Description (stdout)    |   |
+  |  +-----+----------+------------------------------------------+   |
+  |  |  2  | O_WRONLY | -----> Open File Description (stderr)    |   |
+  |  +-----+----------+------------------------------------------+   |
+  |  |  3  | O_RDWR   | -----> Open File Description (socket)  --+---|---+
+  |  +-----+----------+------------------------------------------+   |   |
+  |  |  4  | O_RDONLY | -----> Open File Description (file)      |   |   |
+  |  +-----+----------+------------------------------------------+   |   |
+  |  | ... |   ...    |  ...                                     |   |   |
+  |  +-----+----------+------------------------------------------+   |   |
+  |                                                                  |   |
+  +------------------------------------------------------------------+   |
+                                                                         |
+              +----------------------------------------------------------+
+              |
+              v
+  +------------------------------------------------------------------+
+  |              OPEN FILE DESCRIPTION (in kernel)                   |
+  |              (also called "file object" or "file structure")     |
+  +------------------------------------------------------------------+
+  |                                                                  |
+  |  +------------------------------------------------------------+  |
+  |  |  File Offset (current position): 0                         |  |
+  |  |  Access Mode: O_RDWR                                       |  |
+  |  |  Status Flags: O_NONBLOCK                                  |  |
+  |  |  Reference Count: 1                                        |  |
+  |  |  Pointer to Inode/Socket -------+                          |  |
+  |  +------------------------------------------------------------+  |
+  |                                    |                             |
+  +------------------------------------|-----------------------------|
+                                       |
+                                       v
+  +------------------------------------------------------------------+
+  |              SOCKET STRUCTURE (for network fd)                   |
+  +------------------------------------------------------------------+
+  |                                                                  |
+  |  +------------------------------------------------------------+  |
+  |  |  Type: SOCK_STREAM                                         |  |
+  |  |  Protocol: IPPROTO_TCP                                     |  |
+  |  |  State: ESTABLISHED                                        |  |
+  |  |  Local Address: 192.168.1.10:54321                         |  |
+  |  |  Remote Address: 10.0.0.1:80                               |  |
+  |  |  Send Buffer: [kernel memory region]                       |  |
+  |  |  Receive Buffer: [kernel memory region]                    |  |
+  |  |  Socket Options: { SO_REUSEADDR, SO_KEEPALIVE, ... }       |  |
+  |  |  Wait Queue: [list of waiting processes]                   |  |
+  |  +------------------------------------------------------------+  |
+  |                                                                  |
+  +------------------------------------------------------------------+
+```
+
+### What's Inside Each Layer
+
+```
++------------------------------------------------------------------+
+|         DETAILED BREAKDOWN OF EACH COMPONENT                     |
++------------------------------------------------------------------+
+
+1. FILE DESCRIPTOR (the integer itself)
+   +--------------------------------------------------------------+
+   |  Just a number: 0, 1, 2, 3, 4, 5, ...                        |
+   |                                                              |
+   |  - Allocated by kernel on open()/socket()/accept()           |
+   |  - Always uses lowest available number                       |
+   |  - Released on close()                                       |
+   |  - Valid only within the process that owns it                |
+   |                                                              |
+   |  Default FDs:                                                |
+   |    0 = stdin  (standard input)                               |
+   |    1 = stdout (standard output)                              |
+   |    2 = stderr (standard error)                               |
+   |    3+ = your files, sockets, pipes, etc.                     |
+   +--------------------------------------------------------------+
+
+2. FILE DESCRIPTOR TABLE ENTRY (per-process)
+   +--------------------------------------------------------------+
+   |  struct fdtable_entry {                                      |
+   |      int flags;           // FD_CLOEXEC, etc.                |
+   |      struct file *file;   // pointer to open file description|
+   |  }                                                           |
+   |                                                              |
+   |  Flags stored here:                                          |
+   |    - FD_CLOEXEC: close fd on exec() call                     |
+   +--------------------------------------------------------------+
+
+3. OPEN FILE DESCRIPTION (shared, in kernel)
+   +--------------------------------------------------------------+
+   |  struct file {                                               |
+   |      loff_t f_pos;        // current read/write offset       |
+   |      unsigned int f_flags; // O_RDONLY, O_NONBLOCK, etc.     |
+   |      fmode_t f_mode;      // read/write permissions          |
+   |      atomic_t f_count;    // reference count                 |
+   |      struct inode *f_inode;    // for files                  |
+   |      struct socket *f_socket;  // for sockets                |
+   |      const struct file_operations *f_op; // read/write funcs |
+   |  }                                                           |
+   |                                                              |
+   |  This is SHARED when:                                        |
+   |    - fork() duplicates fd table (parent & child share this)  |
+   |    - dup()/dup2() creates alias to same description          |
+   +--------------------------------------------------------------+
+
+4. SOCKET STRUCTURE (for network file descriptors)
+   +--------------------------------------------------------------+
+   |  struct socket {                                             |
+   |      socket_state state;      // SS_CONNECTED, etc.          |
+   |      short type;              // SOCK_STREAM, SOCK_DGRAM     |
+   |      struct sock *sk;         // protocol-specific socket    |
+   |  }                                                           |
+   |                                                              |
+   |  struct sock {  // TCP-specific                              |
+   |      // Connection identity                                  |
+   |      __be32 saddr, daddr;     // source/dest IP              |
+   |      __be16 sport, dport;     // source/dest port            |
+   |                                                              |
+   |      // TCP state machine                                    |
+   |      int sk_state;            // TCP_ESTABLISHED, etc.       |
+   |                                                              |
+   |      // Buffers                                              |
+   |      struct sk_buff_head sk_receive_queue;  // incoming data |
+   |      struct sk_buff_head sk_write_queue;    // outgoing data |
+   |                                                              |
+   |      // TCP-specific fields                                  |
+   |      u32 snd_una;             // oldest unacked seq          |
+   |      u32 snd_nxt;             // next seq to send            |
+   |      u32 rcv_nxt;             // next seq expected           |
+   |      u32 snd_wnd;             // send window size            |
+   |      u32 rcv_wnd;             // receive window size         |
+   |                                                              |
+   |      // Wait queues                                          |
+   |      struct socket_wq *wq;    // processes waiting on socket |
+   |  }                                                           |
+   +--------------------------------------------------------------+
+```
+
+### File Descriptor Sharing Scenarios
+
+```
++------------------------------------------------------------------+
+|              FILE DESCRIPTOR SHARING                             |
++------------------------------------------------------------------+
+
+SCENARIO 1: dup() / dup2()
+-----------------------------
+  fd=3 ----+
+           |----> Open File Description ----> Socket
+  fd=4 ----+      (shared offset, flags)
+
+  Both fds point to SAME open file description
+  close(3) doesn't close socket until close(4) too
+
+
+SCENARIO 2: fork()
+-----------------------------
+
+  PARENT (before fork)
+  fd=3 --------> Open File Description ----> Socket
+
+  PARENT (after fork)          CHILD (after fork)
+  fd=3 ----+                   fd=3 ----+
+           |                            |
+           +---> Open File Description -+----> Socket
+                 (SHARED between parent & child)
+
+  Either process can read/write
+  Socket closed only when BOTH close their fd=3
+
+
+SCENARIO 3: Independent open()/socket()
+-----------------------------
+
+  Process A                    Process B
+  fd=3 ----> OFD A ----> Socket A
+                                     fd=3 ----> OFD B ----> Socket B
+
+  Same fd number, but COMPLETELY different resources
+  fd is just an index within each process
+```
+
+### System Calls and File Descriptors
+
+```
++------------------------------------------------------------------+
+|           FILE DESCRIPTOR LIFECYCLE                              |
++------------------------------------------------------------------+
+
+  CREATION:
+  +--------------------------------------------------------------+
+  |  int fd = socket(AF_INET, SOCK_STREAM, 0);                   |
+  |                                                              |
+  |  Kernel does:                                                |
+  |  1. Find lowest unused fd in process's table (e.g., 3)       |
+  |  2. Allocate Open File Description structure                 |
+  |  3. Allocate Socket structure                                |
+  |  4. Link: fd table[3] -> OFD -> Socket                       |
+  |  5. Return 3 to user                                         |
+  +--------------------------------------------------------------+
+
+  OPERATIONS:
+  +--------------------------------------------------------------+
+  |  read(fd, buffer, size)                                      |
+  |                                                              |
+  |  Kernel does:                                                |
+  |  1. Look up fd in process's fd table                         |
+  |  2. Follow pointer to Open File Description                  |
+  |  3. Follow pointer to Socket structure                       |
+  |  4. Copy data from socket's receive buffer to user buffer    |
+  |  5. Return bytes read                                        |
+  +--------------------------------------------------------------+
+
+  CLOSING:
+  +--------------------------------------------------------------+
+  |  close(fd)                                                   |
+  |                                                              |
+  |  Kernel does:                                                |
+  |  1. Look up fd in process's fd table                         |
+  |  2. Mark fd table entry as unused                            |
+  |  3. Decrement OFD reference count                            |
+  |  4. If refcount == 0:                                        |
+  |     - For socket: initiate TCP FIN sequence                  |
+  |     - Free socket buffers                                    |
+  |     - Free OFD structure                                     |
+  |  5. fd number can now be reused                              |
+  +--------------------------------------------------------------+
+```
+
+### Limits on File Descriptors
+
+```
++------------------------------------------------------------------+
+|           FILE DESCRIPTOR LIMITS                                 |
++------------------------------------------------------------------+
+
+  PER-PROCESS LIMIT (soft/hard):
+  +--------------------------------------------------------------+
+  |  $ ulimit -n        # show soft limit (often 1024)           |
+  |  $ ulimit -Hn       # show hard limit (often 1048576)        |
+  |                                                              |
+  |  Can be increased in:                                        |
+  |  - /etc/security/limits.conf                                 |
+  |  - setrlimit() system call                                   |
+  +--------------------------------------------------------------+
+
+  SYSTEM-WIDE LIMIT:
+  +--------------------------------------------------------------+
+  |  $ cat /proc/sys/fs/file-max    # e.g., 9223372036854775807  |
+  |  $ cat /proc/sys/fs/file-nr     # allocated, free, max       |
+  +--------------------------------------------------------------+
+
+  WHY LIMITS MATTER:
+  +--------------------------------------------------------------+
+  |  - Each TCP connection needs a file descriptor               |
+  |  - Server with 10,000 connections = 10,000+ fds              |
+  |  - "Too many open files" error = hit the limit               |
+  |  - High-performance servers increase limits significantly    |
+  +--------------------------------------------------------------+
+```
+
 ### Kernel Network Stack Architecture
 
 ```
