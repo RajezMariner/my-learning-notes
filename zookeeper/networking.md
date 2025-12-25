@@ -1465,6 +1465,12 @@ Think of it this way:
                  +----> Connection 2    <-- NOT how it works!
                  +----> Connection 3
 
+  WRONG: "One connection has multiple sockets"
+
+      Connection ----+----> Socket 1
+                     +----> Socket 2    <-- Also NOT how it works!
+                     +----> Socket 3
+
   CORRECT: "One socket = One connection (for connected sockets)"
 
       Socket A --------> Connection 1
@@ -1484,6 +1490,105 @@ Think of it this way:
 
       Listening socket does NOT have a connection
       It creates NEW sockets that have connections
+```
+
+### Socket-Connection Relationship (Important!)
+
+```
++------------------------------------------------------------------+
+|           ONE CONNECTION = ONE SOCKET (per endpoint)             |
++------------------------------------------------------------------+
+
+  A TCP connection has exactly TWO sockets: one on each end
+
+  Client Side                              Server Side
+  +----------+                             +----------+
+  | Socket A |<===== TCP Connection ======>| Socket X |
+  | (fd=5)   |                             | (fd=7)   |
+  +----------+                             +----------+
+
+  - The connection exists BETWEEN the two sockets
+  - Each endpoint has exactly ONE socket for this connection
+  - Total: 2 sockets (one on each side) for 1 connection
+
+
++------------------------------------------------------------------+
+|           MULTIPLE CLIENTS = MULTIPLE SOCKETS                    |
++------------------------------------------------------------------+
+
+  Server with 3 clients = 4 sockets on server (1 listening + 3 connected)
+
+  Server Machine:
+  +---------------------+
+  | Listening Socket    |  fd=3, port 80
+  | (NO connection)     |  Just waits for incoming connections
+  +---------------------+
+           |
+           | accept() creates NEW socket for each client
+           |
+  +--------+---------+---------+
+  |        |         |         |
+  v        v         v         v
+  fd=4     fd=5      fd=6
+  |        |         |
+  v        v         v
+  Conn 1   Conn 2    Conn 3    <-- Each socket has ONE connection
+  |        |         |
+  v        v         v
+  Client A Client B  Client C
+
+
+  SOCKET COUNT:
+  +--------------------------------------------------------------+
+  | Server side: 4 sockets (1 listening + 3 connected)           |
+  | Client side: 3 sockets (1 per client)                        |
+  | Connections: 3 total                                         |
+  | Ratio: 1 connected socket = 1 connection (always!)           |
+  +--------------------------------------------------------------+
+
+
++------------------------------------------------------------------+
+|           HTTP KEEP-ALIVE (Often Misunderstood)                  |
++------------------------------------------------------------------+
+
+  People sometimes think multiple HTTP requests = multiple connections
+  THIS IS WRONG!
+
+  +----------+                             +----------+
+  | Socket   |<==== 1 TCP Connection ====>| Socket   |
+  | (fd=5)   |                             | (fd=7)   |
+  +----------+                             +----------+
+       |
+       |  HTTP Request 1  ------>
+       |  <------ HTTP Response 1
+       |  HTTP Request 2  ------>
+       |  <------ HTTP Response 2
+       |  HTTP Request 3  ------>
+       |  <------ HTTP Response 3
+       |
+  SAME socket, SAME connection, multiple HTTP requests
+  (NOT multiple connections, NOT multiple sockets!)
+
+
++------------------------------------------------------------------+
+|                    SUMMARY TABLE                                 |
++------------------------------------------------------------------+
+
+  Scenario                          | Sockets      | Connections
+  ----------------------------------|--------------|-------------
+  1 client connects to server       | 2 (1 each    | 1
+                                    |    side)     |
+  ----------------------------------|--------------|-------------
+  3 clients connect to server       | 4 on server  | 3
+                                    | (1 listen +  |
+                                    |  3 connected)|
+                                    | 3 on clients |
+  ----------------------------------|--------------|-------------
+  HTTP keep-alive with 10 requests  | 2 (1 each    | 1
+                                    |    side)     |
+  ----------------------------------|--------------|-------------
+
+  THE RULE: 1 connected socket = 1 connection (ALWAYS)
 ```
 
 ### Summary Comparison Table
@@ -1560,6 +1665,398 @@ Think of it this way:
 
 ---
 
+## Web Server Sockets: Practical Examples
+
+When you start a web server, how many sockets are created? Let's explore with real examples.
+
+### Server Startup: The Listening Socket
+
+```
++------------------------------------------------------------------+
+|           WHEN YOU START A WEB SERVER                            |
++------------------------------------------------------------------+
+
+  $ uvicorn main:app --host 0.0.0.0 --port 8000
+
+  What happens:
+
+  1. Server process starts
+  2. Creates ONE listening socket
+  3. Binds it to 0.0.0.0:8000
+  4. Calls listen() - now waiting for connections
+
+  At this point:
+  +--------------------------------------------------------------+
+  | Sockets: 1 (the listening socket)                            |
+  | Connections: 0 (no clients yet)                              |
+  +--------------------------------------------------------------+
+
+  Server Process
+  +---------------------------+
+  |  Listening Socket (fd=3)  |
+  |  State: LISTEN            |
+  |  Bound to: 0.0.0.0:8000   |
+  |  NO connection            |
+  +---------------------------+
+```
+
+### When Clients Connect
+
+```
++------------------------------------------------------------------+
+|           CLIENTS START CONNECTING                               |
++------------------------------------------------------------------+
+
+  After 3 clients connect:
+
+  Server Process
+  +---------------------------+
+  |  Listening Socket (fd=3)  |  <-- Still listening for MORE clients
+  |  State: LISTEN            |
+  |  Bound to: 0.0.0.0:8000   |
+  +---------------------------+
+           |
+           | accept() was called 3 times
+           |
+  +--------+--------+--------+
+  |        |        |        |
+  v        v        v        v
+  +------+ +------+ +------+
+  | fd=4 | | fd=5 | | fd=6 |
+  | ESTAB| | ESTAB| | ESTAB|
+  +------+ +------+ +------+
+     |        |        |
+     v        v        v
+  Client1  Client2  Client3
+
+  Socket count:
+  +--------------------------------------------------------------+
+  | Listening socket: 1                                          |
+  | Connected sockets: 3                                         |
+  | TOTAL: 4 sockets                                             |
+  | Connections: 3                                               |
+  +--------------------------------------------------------------+
+```
+
+### FastAPI/Uvicorn Example
+
+```
++------------------------------------------------------------------+
+|           FASTAPI WITH UVICORN                                   |
++------------------------------------------------------------------+
+
+  # main.py
+  from fastapi import FastAPI
+  app = FastAPI()
+
+  @app.get("/")
+  def read_root():
+      return {"Hello": "World"}
+
+  # Run with: uvicorn main:app --workers 4
+
+
+  SINGLE WORKER (default):
+  ========================
+
+  $ uvicorn main:app --port 8000
+
+  +--------------------------------------------------+
+  |  Uvicorn Process (PID 1234)                      |
+  |                                                  |
+  |  +--------------------------------------------+  |
+  |  | Listening Socket (fd=3)                   |  |
+  |  | 0.0.0.0:8000                               |  |
+  |  +--------------------------------------------+  |
+  |                                                  |
+  |  Event loop (asyncio) handles all connections   |
+  |  using non-blocking I/O                         |
+  |                                                  |
+  |  When 100 clients connect:                      |
+  |  - 1 listening socket                           |
+  |  - 100 connected sockets                        |
+  |  - All in ONE process                           |
+  |  - Total: 101 sockets, 100 connections          |
+  +--------------------------------------------------+
+
+
+  MULTIPLE WORKERS:
+  =================
+
+  $ uvicorn main:app --port 8000 --workers 4
+
+  Main Process (manages workers)
+  +--------------------------------------------------+
+  |                                                  |
+  |  Creates listening socket, then forks workers   |
+  |                                                  |
+  +--------------------------------------------------+
+           |
+           | fork()
+           |
+  +--------+--------+--------+--------+
+  |        |        |        |        |
+  v        v        v        v        v
+
+  Worker 1    Worker 2    Worker 3    Worker 4
+  (PID 1001)  (PID 1002)  (PID 1003)  (PID 1004)
+  +--------+  +--------+  +--------+  +--------+
+  |fd=3    |  |fd=3    |  |fd=3    |  |fd=3    |
+  |LISTEN  |  |LISTEN  |  |LISTEN  |  |LISTEN  |
+  |:8000   |  |:8000   |  |:8000   |  |:8000   |
+  +--------+  +--------+  +--------+  +--------+
+
+  All 4 workers SHARE the same listening socket!
+  (via fork() - they inherit the same fd)
+
+  When connection comes in:
+  - Kernel wakes up ONE worker (usually)
+  - That worker calls accept()
+  - Gets NEW socket for that connection
+  - Other workers continue listening
+
+  With 100 connections distributed across workers:
+  +--------------------------------------------------------------+
+  | Worker 1: 1 listening + ~25 connected = ~26 sockets          |
+  | Worker 2: 1 listening + ~25 connected = ~26 sockets          |
+  | Worker 3: 1 listening + ~25 connected = ~26 sockets          |
+  | Worker 4: 1 listening + ~25 connected = ~26 sockets          |
+  |                                                              |
+  | Note: All 4 "listening sockets" are actually the SAME        |
+  | underlying socket (shared via fork)                          |
+  |                                                              |
+  | Unique sockets: 1 listening + 100 connected = 101            |
+  | Connections: 100                                             |
+  +--------------------------------------------------------------+
+```
+
+### Gunicorn with Sync Workers
+
+```
++------------------------------------------------------------------+
+|           GUNICORN SYNC WORKERS (Thread-per-request)             |
++------------------------------------------------------------------+
+
+  $ gunicorn --workers 4 --threads 2 main:app
+
+  Worker 1 (PID 1001)
+  +--------------------------------------------------+
+  |  Listening Socket (fd=3) - shared                |
+  |                                                  |
+  |  Thread Pool (2 threads)                         |
+  |  +------------------+  +------------------+      |
+  |  | Thread 1         |  | Thread 2         |      |
+  |  | Handles 1 conn   |  | Handles 1 conn   |      |
+  |  | at a time        |  | at a time        |      |
+  |  +------------------+  +------------------+      |
+  |                                                  |
+  |  Max concurrent connections per worker: 2       |
+  +--------------------------------------------------+
+
+  4 workers x 2 threads = 8 concurrent connections max
+
+  With 8 active connections:
+  +--------------------------------------------------------------+
+  | Listening sockets: 1 (shared)                                |
+  | Connected sockets: 8 (2 per worker)                          |
+  | Total unique sockets: 9                                      |
+  +--------------------------------------------------------------+
+```
+
+### Java Jersey/Tomcat Example
+
+```
++------------------------------------------------------------------+
+|           JERSEY ON TOMCAT (Thread Pool Model)                   |
++------------------------------------------------------------------+
+
+  Tomcat uses a different model: Thread Pool with blocking I/O
+
+  Tomcat Process (Single JVM)
+  +----------------------------------------------------------+
+  |                                                          |
+  |  Acceptor Thread                                         |
+  |  +----------------------------------------------------+  |
+  |  | Listening Socket (ServerSocket)                    |  |
+  |  | Bound to 0.0.0.0:8080                              |  |
+  |  | Calls accept() in a loop                           |  |
+  |  +----------------------------------------------------+  |
+  |                                                          |
+  |  When connection arrives:                                |
+  |  1. accept() returns new Socket                          |
+  |  2. Hand Socket to a worker thread from pool             |
+  |  3. Continue accepting more connections                  |
+  |                                                          |
+  |  Thread Pool (default 200 threads)                       |
+  |  +----------------------------------------------------+  |
+  |  | Thread-1: Socket fd=101 -> Client A                |  |
+  |  | Thread-2: Socket fd=102 -> Client B                |  |
+  |  | Thread-3: Socket fd=103 -> Client C                |  |
+  |  | ...                                                |  |
+  |  | Thread-200: (idle, waiting for work)               |  |
+  |  +----------------------------------------------------+  |
+  |                                                          |
+  +----------------------------------------------------------+
+
+  With 150 concurrent connections:
+  +--------------------------------------------------------------+
+  | Listening socket: 1                                          |
+  | Connected sockets: 150                                       |
+  | Total sockets: 151                                           |
+  | Active threads: 150 (one per connection)                     |
+  | Idle threads: 50                                             |
+  +--------------------------------------------------------------+
+
+  BLOCKING vs NON-BLOCKING I/O:
+  +--------------------------------------------------------------+
+  | Tomcat (blocking):    1 thread per connection                |
+  |                       200 threads = 200 max connections      |
+  |                       Simple but doesn't scale well          |
+  |                                                              |
+  | Uvicorn (non-block):  1 thread handles thousands             |
+  |                       Uses select/epoll/kqueue               |
+  |                       Complex but scales very well           |
+  +--------------------------------------------------------------+
+```
+
+### Netty/Spring WebFlux (NIO Model)
+
+```
++------------------------------------------------------------------+
+|           SPRING WEBFLUX / NETTY (Non-blocking I/O)              |
++------------------------------------------------------------------+
+
+  Netty uses event-driven, non-blocking I/O (similar to Node.js)
+
+  Netty Process (Single JVM)
+  +----------------------------------------------------------+
+  |                                                          |
+  |  Boss Event Loop (1 thread typically)                    |
+  |  +----------------------------------------------------+  |
+  |  | Listening ServerSocketChannel                      |  |
+  |  | Registered with Selector                           |  |
+  |  | Handles: OP_ACCEPT events                          |  |
+  |  +----------------------------------------------------+  |
+  |           |                                              |
+  |           | New connection -> hand to worker             |
+  |           v                                              |
+  |  Worker Event Loop Group (N threads, usually CPU cores)  |
+  |  +----------------------------------------------------+  |
+  |  | Worker 1: Selector watching 500 SocketChannels     |  |
+  |  | Worker 2: Selector watching 500 SocketChannels     |  |
+  |  | Worker 3: Selector watching 500 SocketChannels     |  |
+  |  | Worker 4: Selector watching 500 SocketChannels     |  |
+  |  +----------------------------------------------------+  |
+  |                                                          |
+  |  Each worker handles MANY connections (non-blocking)     |
+  |                                                          |
+  +----------------------------------------------------------+
+
+  With 2000 concurrent connections on 4-core machine:
+  +--------------------------------------------------------------+
+  | Boss thread: 1 listening socket                              |
+  | Worker threads: 4 (one per core)                             |
+  | Sockets per worker: ~500                                     |
+  | Total sockets: 1 + 2000 = 2001                               |
+  | Total threads: 5 (1 boss + 4 workers)                        |
+  |                                                              |
+  | Compare to Tomcat:                                           |
+  | Tomcat would need 2000 threads for 2000 connections!        |
+  +--------------------------------------------------------------+
+```
+
+### Socket Scaling Summary
+
+```
++------------------------------------------------------------------+
+|           SERVER SOCKET SCALING COMPARISON                       |
++------------------------------------------------------------------+
+
+  Server starts (no clients):
+  +--------------------------------------------------------------+
+  | Model              | Processes | Threads | Sockets            |
+  +--------------------+-----------+---------+--------------------+
+  | Uvicorn (1 worker) | 1         | 1       | 1 listening        |
+  | Uvicorn (4 workers)| 4         | 4       | 1 shared listening |
+  | Gunicorn sync      | 4         | 8       | 1 shared listening |
+  | Tomcat             | 1         | ~10     | 1 listening        |
+  | Netty              | 1         | 5       | 1 listening        |
+  +--------------------------------------------------------------+
+
+
+  With 1000 concurrent connections:
+  +--------------------------------------------------------------+
+  | Model              | Processes | Threads | Sockets            |
+  +--------------------+-----------+---------+--------------------+
+  | Uvicorn (1 worker) | 1         | 1       | 1001 (1+1000)      |
+  | Uvicorn (4 workers)| 4         | 4       | 1001 (1+1000)      |
+  | Gunicorn sync      | 4         | 8       | MAX 8 connections! |
+  | Tomcat (200 pool)  | 1         | 200+    | MAX 200 or queue   |
+  | Netty (4 workers)  | 1         | 5       | 1001 (1+1000)      |
+  +--------------------------------------------------------------+
+
+
+  FORMULA:
+  +--------------------------------------------------------------+
+  |  Sockets at any time = 1 (listening) + N (active connections)|
+  |                                                              |
+  |  For blocking I/O:   Max connections = Thread pool size     |
+  |  For non-blocking:   Max connections = File descriptor limit |
+  |                      (ulimit -n, often 1024-1M)              |
+  +--------------------------------------------------------------+
+```
+
+### Viewing Sockets in Practice
+
+```
++------------------------------------------------------------------+
+|           HOW TO SEE YOUR SERVER'S SOCKETS                       |
++------------------------------------------------------------------+
+
+  Linux commands to inspect sockets:
+
+  # See all TCP sockets for a process
+  $ ss -tlnp | grep 8000
+  LISTEN  0  128  0.0.0.0:8000  *:*  users:(("uvicorn",pid=1234,fd=3))
+
+  # See all connections to your server
+  $ ss -tn | grep 8000
+  ESTAB  0  0  192.168.1.10:8000  192.168.1.20:54321
+  ESTAB  0  0  192.168.1.10:8000  192.168.1.21:54322
+  ESTAB  0  0  192.168.1.10:8000  192.168.1.22:54323
+
+  # Count connections
+  $ ss -tn | grep 8000 | wc -l
+  3
+
+  # See file descriptors for a process
+  $ ls -la /proc/1234/fd/
+  lrwx------ 1 user user 64 Dec 25 10:00 0 -> /dev/pts/0
+  lrwx------ 1 user user 64 Dec 25 10:00 1 -> /dev/pts/0
+  lrwx------ 1 user user 64 Dec 25 10:00 2 -> /dev/pts/0
+  lrwx------ 1 user user 64 Dec 25 10:00 3 -> socket:[12345]  <- listening
+  lrwx------ 1 user user 64 Dec 25 10:00 4 -> socket:[12346]  <- connection 1
+  lrwx------ 1 user user 64 Dec 25 10:00 5 -> socket:[12347]  <- connection 2
+
+  # Using lsof
+  $ lsof -i :8000
+  COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+  uvicorn 1234 user    3u  IPv4  12345      0t0  TCP *:8000 (LISTEN)
+  uvicorn 1234 user    4u  IPv4  12346      0t0  TCP ...:8000->...:54321 (ESTABLISHED)
+  uvicorn 1234 user    5u  IPv4  12347      0t0  TCP ...:8000->...:54322 (ESTABLISHED)
+
+
+  Python check (inside your app):
+  +--------------------------------------------------------------+
+  | import os                                                    |
+  | fd_count = len(os.listdir(f'/proc/{os.getpid()}/fd'))        |
+  | print(f"Open file descriptors: {fd_count}")                  |
+  +--------------------------------------------------------------+
+```
+
+---
+
 ## Related Topics
+- [TCP and UDP Protocols](./tcp-udp-protocols.md) - Deep dive into transport protocols
 - Network programming in various languages (Java NIO, Python asyncio, Go net)
 - Advanced topics: epoll, kqueue, io_uring, DPDK
